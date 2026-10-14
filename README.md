@@ -132,7 +132,7 @@ suppressed / mis-timed, the rank data that fills the board is missing too.
 
 ### 3. `game.exe` stuck on "Loading Player Data..."
 
-Root cause found and patched, **NOT VERIFIED IN-GAME**. See the section below.
+Root cause found and patched, **VERIFIED IN-GAME**. See the section below.
 
 ---
 

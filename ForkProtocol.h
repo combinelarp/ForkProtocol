@@ -524,9 +524,10 @@ public:
 	// reaction to the join, not the real end of the match.
 	//
 	// A genuine match-over never coincides with a join, so the choke suppresses
-	// a settlement for a fork session only while some player's join (login)
-	// happened within kJoinSettlementGraceMs. Outside that window the packet is
-	// forwarded untouched, so the real end screen still reaches the 10096
+	// a settlement for a fork session while EITHER some session is still in its
+	// join pipeline (connected, not yet spawned) OR a join stage happened within
+	// kJoinSettlementGraceMs. Outside both the packet is forwarded untouched,
+	// so the real end screen still reaches the 10096
 	// client. Stock sessions never take part in this.
 	// ---------------------------------------------------------------------
 	struct RecentJoins
@@ -538,6 +539,12 @@ public:
 		{
 			std::lock_guard<std::mutex> lock(m_mutex);
 			m_lastMs = nowMs;
+		}
+
+		ui32 lastMs()
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			return m_lastMs;
 		}
 
 		bool within(ui32 nowMs, ui32 windowMs)
@@ -556,16 +563,96 @@ public:
 		return joins;
 	}
 
-	// Grace window (ms) after the most recent player join during which a
-	// settlement is treated as the spurious join-triggered one. Must cover the
-	// whole load / spawn / first-tick of the joining client, which is what
-	// actually triggers the screen on the already-present player.
-	static const ui32 kJoinSettlementGraceMs = 20000;
+	// Join pipeline: the set of sessions that connected but have not finished
+	// loading into the world yet.
+	//
+	// This is the state-based half of the settlement choke and it is the part
+	// that actually matters. The spurious "results" screen is produced by the
+	// game-mode Lua, and that pipeline is asynchronous end to end: the mode
+	// reacts on PlayerLoginEvent, then RewardManager -> WebService.asyncPost
+	// has to come back before HostApi.sendGameSettlement ever runs. With no
+	// reachable reward backend that call only returns after the HTTP timeout,
+	// so the settlement can land LONG after the 20s login-based grace window
+	// had already expired - which is exactly why the choke never fired and
+	// never logged. Keying the window off "somebody is still joining" removes
+	// that race instead of guessing at a bigger number.
+	struct PendingJoiners
+	{
+		std::mutex m_mutex;
+		std::set<ui64> m_ids;
 
-	// Called from the C++ join path (ClientPeer::login).
+		void add(ui64 rakssid)
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			m_ids.insert(rakssid);
+		}
+
+		void remove(ui64 rakssid)
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			m_ids.erase(rakssid);
+		}
+
+		bool any()
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			return !m_ids.empty();
+		}
+	};
+	static PendingJoiners& pendingJoiners()
+	{
+		static PendingJoiners joiners;
+		return joiners;
+	}
+
+	// Grace window (ms) after the most recent join *stage* (connect, login,
+	// spawn, client-ready) during which a settlement is treated as the spurious
+	// join-triggered one. Re-armed by every stage, so it always measures from
+	// the LAST thing the joining client did rather than from its login alone.
+	static const ui32 kJoinSettlementGraceMs = 60000;
+
+	// Called from the C++ join path (ServerNetwork::onServerNetworkConnSucc,
+	// ClientPeer::login, ClientPeer::onSpawn).
 	static void markPlayerJoined(ui32 nowMs)
 	{
 		recentJoins().mark(nowMs);
+	}
+
+	// A session that connected but never spawned (bad handshake, kick during
+	// login) would otherwise keep the choke armed forever, so every exit path
+	// drops it again.
+	static void notePeerConnected(ui64 rakssid)
+	{
+		pendingJoiners().add(rakssid);
+	}
+
+	static void notePeerSpawned(ui64 rakssid)
+	{
+		pendingJoiners().remove(rakssid);
+	}
+
+	static void notePeerGone(ui64 rakssid)
+	{
+		pendingJoiners().remove(rakssid);
+	}
+
+	static bool joinPipelineActive()
+	{
+		return pendingJoiners().any();
+	}
+
+	// Re-arms the window from a suppression, so a burst of settlements that
+	// trickles in late (one per player, each behind its own web call) is all
+	// caught instead of only the first one.
+	static void extendJoinWindow(ui32 nowMs)
+	{
+		recentJoins().mark(nowMs);
+	}
+
+	static ui32 lastJoinAgeMs(ui32 nowMs)
+	{
+		const ui32 last = recentJoins().lastMs();
+		return (last == 0) ? 0xFFFFFFFFu : (nowMs - last);
 	}
 
 	static bool settlementSuppressedByJoinWindow(ui32 nowMs)

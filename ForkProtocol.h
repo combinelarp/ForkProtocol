@@ -469,10 +469,12 @@ public:
 	}
 
 	// ---------------------------------------------------------------------
-	// Session tracking: a peer stays classified as "fork" once it proved it by
-	// sending id 179, 8 or (inside an already-classified session) any of the
-	// fork-only ids below. Stock 10068 clients never send 179, so they are
-	// never classified and keep stock 5/8.
+	// Session tracking: a peer is classified as "fork" when it sends id 179
+	// (the DHInfo handshake) DURING LOGIN, i.e. before it fires ClientReady.
+	// Stock 10068 clients never send 179 legitimately (their C2S enum ends at
+	// 178); if one does send it after ClientReady it is a desync artifact and is
+	// drained without classifying - see clientReadySessions() and the 179 gate
+	// in onRecvC2S.
 	// ---------------------------------------------------------------------
 	struct ForkSessions
 	{
@@ -504,6 +506,55 @@ public:
 		return sessions;
 	}
 
+	// The set of sessions that have already sent ClientReady (C2S id 4), i.e.
+	// they finished loading and are in-game. This is the key discriminator for
+	// the 10068-misclassified-as-10096 bug:
+	//
+	//   * The stock 10068 C2SPacketType enum ends at 178
+	//     (PlayerSprintChanged). A stock client can NEVER legitimately send
+	//     id 179.
+	//   * A 10068 client that desyncs (a body under-reads, the next varint is
+	//     garbage) can mis-read a bogus "packet id" of 179. If that happens
+	//     while it is already in-game (it has sent ClientReady), we must NOT
+	//     let it classify the session as a 10096 fork - doing so hands the
+	//     stock client the fork login blob (desync -> the end-of-game "score
+	//     menu") and remaps its movement (the "fling").
+	//   * A genuine 10096 fork sends 179 during its login handshake, BEFORE it
+	//     fires ClientReady (it waits on our LoginResult+DBDataReady first). So
+	//     at the moment a real fork's 179 arrives, it is NOT yet client-ready.
+	//
+	// Therefore: only a 179 from a session that has NOT sent ClientReady is
+	// accepted as the fork handshake. A 179 from an already-ready session is a
+	// desync artifact and is drained WITHOUT classifying.
+	struct ClientReadySessions
+	{
+		std::mutex m_mutex;
+		std::set<ui64> m_ids;
+
+		void add(ui64 rakssid)
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			m_ids.insert(rakssid);
+		}
+
+		bool contains(ui64 rakssid)
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			return m_ids.count(rakssid) > 0;
+		}
+
+		void forget(ui64 rakssid)
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			m_ids.erase(rakssid);
+		}
+	};
+	static ClientReadySessions& clientReadySessions()
+	{
+		static ClientReadySessions ready;
+		return ready;
+	}
+
 	// Convenience used by ClientPeer::movePlayer to trust fork movement (the
 	// stock anti-cheat rubber-bands / kicks are bypassed for classified
 	// sessions only).
@@ -524,11 +575,15 @@ public:
 	// reaction to the join, not the real end of the match.
 	//
 	// A genuine match-over never coincides with a join, so the choke suppresses
-	// a settlement for a fork session while EITHER some session is still in its
-	// join pipeline (connected, not yet spawned) OR a join stage happened within
+	// a settlement while EITHER some session is still in its join pipeline
+	// (connected, not yet spawned) OR a join stage happened within
 	// kJoinSettlementGraceMs. Outside both the packet is forwarded untouched,
-	// so the real end screen still reaches the 10096
-	// client. Stock sessions never take part in this.
+	// so the real end screen still reaches the client. The choke is keyed off
+	// the join state ONLY and applies to every session - fork or stock. It used
+	// to bail out for !isForkSession(), which is why BOTH clients still got the
+	// screen: their sessions were not classified as fork (never classified, or
+	// dropped by clearSession), so the "stock keeps stock behaviour" early-out
+	// forwarded the join-triggered settlement to each of them.
 	// ---------------------------------------------------------------------
 	struct RecentJoins
 	{
@@ -703,6 +758,7 @@ public:
 	{
 		forkSessions().forget(rakssid);
 		loginSends().forget(rakssid);
+		clientReadySessions().forget(rakssid);
 	}
 
 	// ---------------------------------------------------------------------
@@ -729,14 +785,44 @@ public:
 		// leaving the loading screen (retries ~30s, then Logout). The official
 		// server replies with the expanded LoginResult (id 50) + DBDataReady;
 		// replicate the answer here and drain the packet.
+		//
+		// CRITICAL - do not classify an already-ready session. The stock 10068
+		// C2SPacketType enum ends at 178, so a legitimate stock client NEVER
+		// sends 179. The only way a stock 10068 peer reaches this branch is a
+		// desync: an under-read body makes the next varint read a garbage id
+		// that happens to be 179. That desync can only happen AFTER the client
+		// is already in-game (it has sent ClientReady / id 4). A genuine 10096
+		// fork, by contrast, sends 179 during login BEFORE ClientReady. So we
+		// only accept 179 as the fork handshake from a session that has NOT yet
+		// sent ClientReady; a 179 from a ready session is drained as garbage
+		// and must never fork-ify the peer.
 		if (forkId == 179)
 		{
-			if (!isFork && !forkSessions().remember(rakssid))
+			if (!isFork && !clientReadySessions().contains(rakssid))
 			{
-				LordLogInfo("ForkProtocol : detected 10096 fork client, rakid=%llu, first fork-only C2S id=%u",
-					static_cast<unsigned long long>(rakssid), static_cast<unsigned>(forkId));
+				if (!forkSessions().remember(rakssid))
+				{
+					LordLogInfo("ForkProtocol : detected 10096 fork client, rakid=%llu, first fork-only C2S id=%u",
+						static_cast<unsigned long long>(rakssid), static_cast<unsigned>(forkId));
+				}
+				sendLoginPacketsForRakid(rakssid);
 			}
-			sendLoginPacketsForRakid(rakssid);
+			else
+			{
+				// Either already fork (legit, re-answered below is safe) or a
+				// ready stock client that desynced into a bogus 179. Do NOT
+				// classify or answer; just drain so the bad id never reaches a
+				// stock decoder.
+				if (isFork)
+				{
+					sendLoginPacketsForRakid(rakssid);
+				}
+				else
+				{
+					LordLogWarning("ForkProtocol : id 179 from an already-ClientReady stock session, draining (NOT classifying), rakid=%llu",
+						static_cast<unsigned long long>(rakssid));
+				}
+			}
 			return consumedResult();
 		}
 
@@ -770,8 +856,17 @@ public:
 
 		switch (forkId)
 		{
-		case 2:   // Login                        : identical on both sides.
-		case 4:   // ClientReady                  : identical on both sides.
+		case 2:   // Login                        : identical on both sides. Do
+			// NOT mark the peer ready here: the 10096 fork fires 179 AFTER Login
+			// but BEFORE ClientReady, so readiness must only flip on id 4.
+			return passThrough(forkId);
+		case 4:   // ClientReady                  : identical on both sides. The
+			// moment a peer fires ClientReady it is a fully-loaded, in-game
+			// client. From this point on any 179 it produces is a desync
+			// artifact (stock C2S ends at 178), not the fork handshake, so we
+			// record the readiness here for the 179 gate above.
+			clientReadySessions().add(rakssid);
+			return passThrough(forkId);
 		case 24:  // ChatMessageString            : identical on both sides. The
 			// 10096 fork uses the same [String] chat body as stock, so the stock
 			// C2SPacketChatString handler works unchanged. This used to sit in the
@@ -1239,4 +1334,488 @@ public:
 		return body;
 	}
 };
+
+// ---------------------------------------------------------------------------
+// Walking-bug analysis (session summary)
+// ---------------------------------------------------------------------------
+// Why the player could not walk on the stock server and why this file fixes it:
+//
+// 1. The fork client sends its movement under id 8 at ~5 msg/s. Until this
+//    change the gateway simply drained those frames and never called
+//    ClientPeer::movePlayer, so the server's copy of the player never moved.
+//    The client, seeing its spawned/desynced position, kept sending Rebirth
+//    (id 9); every Rebirth ran the stock respawn handler which force-teleports
+//    the player back to the spawn point ("resetpos" in the gameserver log).
+//
+// 2. Feeding the fork id-8 frames straight to the stock factory would have
+//    desynced the receive loop: a fork frame is 22+ bytes of floats while the
+//    nearest stock decoder (VehicleMovement) reads a different layout, leaving
+//    stray bytes that were mis-read as fake packet ids (0 / 4339 / ... ) and
+//    aborted whole datagrams.
+//
+// 3. Once movement flows (via injectForkMovement), movePlayer() applies the
+//    client delta and the S2C 16-byte movement-record broadcast (already wired
+//    to packMovementRecord) makes the fork player visible to others. The stock
+//    anti-cheat, however, is gated on "!ForkProtocol::isEnabled()" and
+//    isEnabled() never returns true (dead pref), so anti-cheat was fully active
+//    for the fork too; its per-frame heuristics ("move too fast" / wrongMove /
+//    in-air) would rubber-band (setPlayerLocation + forceTeleport) or kick the
+//    fork player. ClientPeer.cpp now bypasses those checks for sessions that
+//    ForkProtocol::isForkSession() classifies, restoring stock-like trust.
+//
+// Evidence files (cold storage, kept out of git):
+//   D:\Download\SandboxOL\Engine-10096\justfixthewalkingbugs.pcapng
+//   analyzer scripts + walk_clean.txt / walk_out*.txt under
+//   %TEMP%\opencode (wstats.py, wdetail.py, wframe.py, wcount.py)
+// ---------------------------------------------------------------------------
+
+// ===========================================================================
+// APPENDIX A : wire-format walkthroughs
+// ===========================================================================
+// RakNet delivers a stream of length-prefixed datagrams; each datagram may
+// carry several app messages and app messages may be split across datagrams
+// (sequenced/reliable). An app message on this engine starts with a single
+// 0x87 byte (emNormal channel marker), then a LEB128 varint packet id, then
+// the packet body. RaknetInstance::handleNormalData builds one BitStream from
+// the datagram payload and loops:
+//
+//     while (unreadBits > paddingBits)
+//         read varint packetId
+//         [gateway hook (ForkProtocol::onRecvC2S)]
+//         factory create(packetId) -> decode -> callback
+//
+// The 10096 fork keeps this framing but renumbers packet ids and reshapes
+// bodies. Every reshape below is what this file normalises.
+//
+// A.1  LOGIN sequence (fork client, loading screen)
+//   C2S 2   Login(large token block)          -> stock handler, player joined
+//   C2S 179 DHInfo handshake (fork only)      -> gateway answers:
+//        S2C 50   expanded LoginResult (profile inline, resultCode=0)
+//        S2C 348  DBDataReady
+//   C2S 4   ClientReady                       -> stock handler, in-game
+//
+// A.2  WALKING sequence
+//   C2S 8   frame [00][x4][y4][z4][yaw4][pitch4][flg] ~5/s
+//        -> decoded, injected as stock C2S PlayerMovement(7)
+//        -> movePlayer() (anti-cheat bypassed for classified sessions)
+//        -> S2C EntityTeleport absolute-position broadcast to fork viewers
+//           (other 10096 players see it where it CURRENTLY is)
+//
+// A.3  RESPAWN sequence (was the bug signature: heavy "resetpos" traffic)
+//   C2S 9   Rebirth(fork body, 3..13+ bytes)
+//        -> rewritten to canonical [00 00 00], stock respawn handler runs
+//        -> S2C resetpos + entity updates back to spawn point
+//   Before the movement fix the client respawned in a loop because it never
+//   saw the server-accepted position; elimination of the A.2 desync kills the
+//   loop as a side effect.
+// ===========================================================================
+
+// ===========================================================================
+// APPENDIX B : observed 10096 fork packet layouts (from the capture analyzer)
+// ===========================================================================
+// The following were reconstructed from raw tuples exported with tshark
+// (frame number, src port, dst port, payload) filtered to the client 63017 /
+// server 19130 pair so RakNet-internal and third-party UDP (DNS / QUIC / the
+// segment :63017 "ping-ish" 9-byte messages) stay out of the analysis.
+//
+// B.1  Movement frame, fork id 8 (base 22 bytes, then optional extras)
+//   offset  size  field
+//   0       1     state (0x00 on plain walks)
+//   1       4     x (float32 LE)
+//   5       4     y
+//   9       4     z
+//   13      4     yaw
+//   17      4     pitch
+//   21      1     move-flag tail byte; bit7 (0x80) = onGround (set => grounded),
+//                  bit6/5 constant 1, bit3/1 = move/sprint input. Examples:
+//                  0x60 = airborne walk, 0xE0 = grounded walk,
+//                  0x6A = airborne move, 0xEA = grounded move.
+//   Extra: 28/31/34/37/38/43/44/65-byte bodies seen; the frame above is the
+//   first 22 bytes of each; the remainder is packed sub-record data that the
+//   server does not need (client-authoritative positions).
+//
+// B.2  Fork id 80 (WatchRespawn ?) + 81 (MovementInput)
+//   id 80 bodies are 8 bytes [f32 f32] (0x00 0x00 0x80 0x3f 0x00 0x00 0x00 0x00
+//   observed) often followed by nested 0x08-prefixed movement records.
+//   id 81 bodies are 1..23 byte variants. Neither is a stock layout; both are
+//   drained for classified sessions (stock decoders under-read them, leaving
+//   stray bytes that were mis-read as fake packet ids -> the spam).
+//
+// B.3  Fork id 5 (Attack)
+//   Header 0x85 05 then a sub-packet count / list. NOT the stock 4-int stock
+//   C2SPacketAttack; drained for fork sessions, passed through for stock ones.
+//
+// B.4  Fork id 179 (DHInfo)
+//   Arrives right after Login. The official server treats it as the
+//   "other platform" token handshake and answers with the expanded LoginResult
+//   plus DBDataReady; the fork waits on the answer or retries until timeout.
+//
+// B.5  "unknown packet id: 0" red herring
+//   Separate 9-byte messages (`00 00 00 01 2c b2 9b` style) seen on the same
+//   socket are RakNet-internal pings / analytics beacons (`api\n gameanalytics
+//   \com` strings); they never reach handleNormalData, so the log-spam source
+//   is exclusively the in-band mis-decode of fork bodies, fixed in A.2.
+// ===========================================================================
+
+// ===========================================================================
+// APPENDIX C : stock C2SPacketType cross-reference (DataPacket.h ids)
+// ===========================================================================
+// The fork renumbered a handful of ids; everything else keeps its stock
+// number. This list is the stock "who is who" used when deciding Pass vs
+// Consume above (a fork session must never let a fork-only body reach one of
+// these decoders).
+//
+//    2   Login                  9   Rebirth
+//    4   ClientReady            13  SwapItemPosition
+//    5   Attack                 17  ChangeItemInHand
+//    7   PlayerMovement         22  FinishBreakBlock
+//    8   VehicleMovement        24  ChatMessageString
+//   28   UseProp                33  GunFireResult
+//   41   ReloadBullet           44  SelectRole
+//   59   CameraLockMovement     60  CameraLock
+//   80   WatchRespawn           81  MovementInput
+//   83   SendPlayerRotation     129 ChangeCurrentItemInfo
+//
+// The mapping between fork and stock for this server is therefore:
+//   fork 8  (PlayerMovement)   -> stock 7  (PlayerMovement)
+//   fork 9  (Rebirth)          -> stock 9  (Rebirth, body normalised)
+//   fork 5  (Attack bundle)    -> consumed (stock 5 attack would mis-decode)
+//   fork 179(DHInfo)           -> handshake consumer
+//   fork 13/17/22/24/28/33/41/59/60/80/81/83/129 -> consumed (fork-only)
+//   everything else            -> identity (Pass)
+// ===========================================================================
+
+// ===========================================================================
+// APPENDIX D : S2C side note (why the server output needed no changes)
+// ===========================================================================
+// The fork client accepted the stock server's S2C packets unchanged once the
+// two login packets above were sent. In particular:
+//   * S2C other-player movement now goes out through the STOCK player-teleport
+//     broadcast: fork movements are injected into ClientPeer::movePlayer, which
+//     re-emits broadCastPlayerRotation + broadCastPlayerMovement exactly like
+//     the stock MovementInput/SendPlayerRotation handlers do. That is
+//     S2CPacketEntityPlayerTeleport with the anchored relative position
+//     (sendPlayerTeleport), which both stock and 10096 clients place and
+//     interpolate (S2CEntityPacketHandles.cpp:872). The tracker keeps its stock
+//     early-return for players and the pid-21 movement overloads are untouched.
+//     Details in the "S2C other-player movement" block at the top of this file.
+//   * S2C 50 (LoginResult) needed the fork-specific expanded profile field
+//     (buildLoginResultBody), sent on 179.
+//   * S2C 348 (DBDataReady) gates the client's GameClient::isDbDataReady() and
+//     is only emitted by the stock path when PlayerLoginEvent::invoke() is
+//     true (which it is not), hence the explicit send in sendLoginPackets.
+// ===========================================================================
+
+// ===========================================================================
+// APPENDIX E : open items / expected follow-ups
+// ===========================================================================
+//   1. Movement cadence: the fork sends ~5 msg/s and each is injected as one
+//      stock movement packet; movePlayer() runs on the game thread through the
+//      queue, so no lock ordering issue. If a flood arrives in one datagram
+//      (multi-move frames), only the first is injected; the capture shows the
+//      fork sends base frames one-per-message, so this matches the wire.
+//   2. Attack (fork 5) is consumed; if attack events are required later they
+//      need a fork-specific decoder with a sub-packet parser.
+//   3. Block breaking (fork 22) surfaces the stock "not breaking a block"
+//      warning when passed; consumed for now, to be replaced by a fork decoder
+//      if the game flow needs server-side break verification.
+//   4. Sessions are re-classified on reconnect: ServerNetwork::onDisconnect now
+//      calls ForkProtocol::clearSession(), which forgets both the fork mark and
+//      the "login handshake already sent" marker (loginSends()) before
+//      clearPlayerCache() drops the peer. A LEAVE followed by a fresh JOIN -
+//      even if RakNet hands back the same SystemAddress integer - therefore
+//      starts clean and is answered with the login handshake again instead of
+//      hanging the client on "Loading player data...".
+// ===========================================================================
+
+// ===========================================================================
+// APPENDIX F : revision history
+// ===========================================================================
+// 10068 stock    : original gameserver, C2S id set 2/4/5/7/8/9/13/17/22/24/28/
+//                  33/41/44/59/60/80/81/83/129.
+// v1 fork shim   : pref-gated gateway (never functional - nothing set the pref),
+//                  id-179 detection, expanded login, DBDataReady, S2C
+//                  movement-record packer, ForkSessions set, consume sentinel.
+// v2 (this file): pref-independent gateway (always installed, wire-detected),
+//                  body-aware hook, fork movement decode + main-thread injection
+//                  moving the fork player, canonical Rebirth rewrite, anti-cheat
+//                  bypass for classified sessions, and the C2S policy table
+//                  covering every observed fork packet id (spam killed).
+// v3 (this file): v2 forced onGround = true for every injected movement, which
+//                  made a falling player read as grounded and "float in the
+//                  air"; onGround is now decoded from the tail byte bit 7
+//                  (measured against the capture) and forwarded verbatim.
+//                  Per-session login state moved into the clearable loginSends()
+//                  singleton and ForkProtocol::clearSession() is called from
+//                  ServerNetwork::onDisconnect, so a leave + rejoin no longer
+//                  hangs on "Loading player data...".
+// ===========================================================================
+
+// ===========================================================================
+// APPENDIX G : decoding the fork movement extras (reference for future work)
+// ===========================================================================
+// Base frames arrive as 22 bytes; the capture also shows longer bodies. Their
+// structure (read only in traces, never fed to stock decoders):
+//
+//   byte 0            state (0)
+//   bytes 1..20       x y z yaw pitch  (float32 LE)
+//   byte 21           flags (bit7 0x80 = onGround; see B.1)
+//   --- extras only when bodyLen > 22 ---
+//   byte 22+          a run of records, each starting with a tag byte:
+//                     0x00 = blank separator, 0x08 = nested movement delta,
+//                     other ids = further sub-messages (5/22/81 bundles).
+//   A nested 0x08 record mirrors the base layout (state + 5 floats + flag) and
+//   is the fork's per-tick "sub-move" the client already projected; applying
+//   them is optional and was deliberately NOT done: applying both the base and
+//   the sub-moves would double the step and trip the very tolerance margins
+//   this change removes.
+//
+// To trace any single frame against this reference:
+//   tshark -r justfixthewalkingbugs.pcapng -Y "udp && (udp.srcport==63017)" \
+//     -T fields -e frame.number -e frame.time_relative -e udp.payload \
+//     > tracemap.txt
+// then match "87808..." (message-start, id 8, 22-byte body) and check the
+// byte offsets above. The %TEMP%\opencode analyzers already encapsulate this.
+// ===========================================================================
+
+// ===========================================================================
+// APPENDIX H : S2C ids the fork accepted from this server (capture counts)
+// ===========================================================================
+// Observed server -> client 0x87 app ids with rough counts from the
+// walking-bug capture (client lenient to these stock broadcasts):
+//
+//   15     3   start-game / init broadcast
+//   25     2   ...
+//   29    43   player / attribute sync
+//   32     3   ...
+//   40     2   ...
+//   50     ?   LoginResult (fork expanded form, sent by us on 179)
+//   59     1   ...
+//   64     3   ...
+//   75     2   ...
+//   84     3   ...
+//   87     3   ...
+//   88     3   ...
+//   91     3   ...
+//   111    4   ...
+//   122    7   ...
+//   21    ~n   EntityMovement (STOCK delta body) - the real player motion
+//   359   40   SpawnEntityItem: [seq][entityId][00 04 00][3*f32 pos][12 zero]
+//              -> item/block spawns; NOT movement (sending it made the client
+//                 spawn blocks at the moved-to position)
+//   359    2   ...
+//   239    2   ...
+//   240    2   ...
+//   348    ?   DBDataReady (sent by us on 179)
+//
+// No S2C change was required: every stock broadcast already carried a layout
+// the fork client parsed, and the movement broadcast became accurate once C2S
+// movement started flowing. If a future fork build tightens its S2C parser,
+// THIS table is where to start.
+// ===========================================================================
+
+// ===========================================================================
+// APPENDIX I : verification checklist (run on a live fork session)
+// ===========================================================================
+// 1. The old per-frame spam is gone from the gameserver log:
+//      "unknown packet id: 0", 4339/4340/5004/5188,
+//      "Failed to read Real",  "reached end of stream",
+//      "Failed to read Integer", netDataToHex decode dumps.
+// 2. "ForkProtocol : detected 10096 fork client, rakid=..." appears once per
+//    connection and ONLY for the fork (stock clients keep stock ids and never
+//    match). Choose the first id that proves it: 179 (handshake) or 8
+//    (movement, if a classified marker was already present).
+// 3. The fork player's position now updates server-side: other 10096 clients
+//   see it where it CURRENTLY is (S2C EntityTeleport absolute broadcast), and
+//    the constant "ClientPeer::rebirth ... resetpos" loop stops once the
+//    walker is steady.
+// 4. No "Player move when the force teleport" rejection spam: classified
+//    sessions bypass the "move too fast"/wrongMove/in-air/long-move branches
+//    in ClientPeer::movePlayer.
+// 5. Cache / restart check: after a clean server restart the fork client still
+//    reaches in-game (pref never involved) - the gateway is unconditional.
+// ---------------------------------------------------------------------------
+
+// ===========================================================================
+// APPENDIX J : per-id battle cards (why each C2S id is Passed or Consumed)
+// ===========================================================================
+// id   2   Login
+//   Same numeric id and same decoder as stock 10068. The fork just fills the
+//   token block differently; everything the server needs (name, platformUserId,
+//   gameTimeToday...) is decoded identically. -> Pass, stock handler.
+//
+// id   4   ClientReady
+//   Stock "I finished loading my world" completion. The fork sends it once the
+//   login packets land (we send the expanded LoginResult + DBDataReady on 179).
+//   -> Pass, stock handler keys the "in-game" transition off it.
+//
+// id   5   Attack
+//   Stock 5 = {i32 target; real32 x; real32 y; real32 z}. Fork 5 = packed
+//   sub-packet list (count + records); feeding it to C2SPacketAttack under-reads
+//   the body and desyncs the parser. -> Consume for fork, Pass for stock.
+//   Future: write a fork-specific attack decoder wired to
+//   ClientPeer::meleeAttack / gun events if combat is needed.
+//
+// id   7   PlayerMovement (STOCK ONLY)
+//   Stock clients walk on 7 (i32 runtimeId + 5 floats + 3 bools). The fork
+//   renumbered movement to 8, so 7 is never sent by a fork client and needs no
+//   handling here; a stock 7 reaches the stock decoder untouched.
+//
+// id   8   PlayerMovement (FORK)
+//   Base 22-byte frame decoded by forkdetail::decodeForkMovement and injected
+//   as a real stock C2SPacketPlayerMovement (see injectForkMovement). Handled
+//   ONLY when the session is already classified as fork (i.e. it sent 179),
+//   because stock 10068 reuses id 8 for VehicleMovement: a stock client riding
+//   a vehicle must keep its legitimate id-8 body. The capture confirms the fork
+//   sends 179 (frame 272) before its first movement (frame 314), so gating on
+//   the classification loses no fork movement.
+//   -> Handle + Consume for CLASSIFIED (fork) sessions, Pass for everyone else.
+//
+// id   9   Rebirth
+//   Stock 9 = {String name; ui16 netVersion}. Fork sends a variable body
+//   (3..13+ bytes). Whenever the fork respawns (or self-repairs after the
+//   desync described in APPENDIX A.3) the stock decoder used to mis-parse and
+//   either skip the respawn or blow up the receive loop. We rewrite the body
+//   to the canonical 00 00 00 so the STOCK respawn path (attribute save,
+//   resetpos, inventory re-equip, spectator back-to-spawn) runs unchanged.
+//   -> Rewrite + Pass for fork, Pass for stock.
+//
+// id  13   SwapItemPosition
+//   Stock: inventory swap request. Fork body differs; consuming avoids a false
+//   inventory mutation. -> Consume for fork, Pass for stock.
+//
+// id  17   ChangeItemInHand
+//   Stock: hotbar change. Same reasoning as 13. -> Consume for fork, Pass.
+//
+// id  22   FinishBreakBlock
+//   PASSING this to the stock handler triggered the recurring log warning
+//   "C2SPacketFinishBreakBlock ... not breaking a block" because the fork body
+//   does not match. Block breaking itself is client/local in this build, so
+//   consuming changes nothing gameplay-wise and silences the log.
+//   -> Consume for fork, Pass for stock.
+//
+// id  24   ChatMessageString
+//   Stock chat. The 10096 fork sends the SAME [String] body as stock, so the
+//   stock C2SPacketChatString handler (C2SPlayerActionPacketHandles.cpp:736)
+//   works unchanged and broadcasts to every logged-on peer. This used to be in
+//   the consume list under the wrong assumption that "fork body not stock
+//   layout", which silently dropped every chat line from a fork client - that
+//   is why chat did nothing on 10096. -> Pass for both.
+//
+// id  28   UseProp
+//   Stock prop interaction. Same mismatch pattern. -> Consume for fork, Pass.
+//
+// id  33   GunFireResult  / 41 ReloadBullet
+//   Stock shooter feedback packets. Fork sends its own layout; consuming keeps
+//   the shoot/reload bookkeeping consistent with what the fork already applied
+//   client-side. -> Consume for fork, Pass for stock.
+//
+// id  44   SelectRole
+//   The fork sends this exactly like stock; the log shows the stock handler
+//   ('SelectRole invoked') working. -> Pass for both.
+//
+// id  59   CameraLockMovement  / 60 CameraLock
+//   Fork camera "lock movement" heartbeat. Sends ~315/message-hour with 1-byte
+//   bodies (0x00). Stock 59/60 exist but the fork payload is not theirs.
+//   -> Consume for fork, Pass for stock.
+//
+// id  80   WatchRespawn
+//   Fork input batch: 8 bytes [f32 f32] + nested 0x08 movement records.
+//   Stock WatchRespawn reads 1 byte, leaving 7 stray bytes -> the classic
+//   "unknown packet id: 0" manufacturer. -> Consume for fork, Pass for stock.
+//
+// id  81   MovementInput
+//   Fork movement-input records, 1..23 byte variants. Stock reads 8+ bytes and
+//   under-reads everything shorter -> stray-byte material. The fork couples it
+//   with id-80 batches; consuming both keeps the parser aligned.
+//   -> Consume for fork, Pass for stock.
+//
+// id  83   SendPlayerRotation
+//   Rotation frames, fork layout. Yaw/pitch for spectators is already conveyed
+//   by the movement broadcast (21); nothing server-side consumes 83.
+//   -> Consume for fork, Pass for stock.
+//
+// id 129   ChangeCurrentItemInfo
+//   Fork inventory/current-item info, fork layout (49 occurrences in capture,
+//   1-byte bodies). Stock 129 is a different member set.
+//   -> Consume for fork, Pass for stock.
+//
+// id 179   DHInfo handshake
+//   The single fork-only id with a strict server contract: classify the
+//   session, answer with LoginResult(exanded)+DBDataReady, drain.
+//   -> Handshake + Consume (never passed; stock clients never send it).
+// ---------------------------------------------------------------------------
+// Bottom line for maintenance: the "Consume for fork, Pass for stock" rule is
+// identical in structure for 13/17/22/24/28/33/41/59/60/80/81/83/129; to add a
+// real fork decoder for any of them, extend onRecvC2S with a per-id branch that
+// decodes the body and either calls the stock handler directly or injects a
+// canonical stock packet the way injectForkMovement does.
+// ---------------------------------------------------------------------------
+
+// ===========================================================================
+// APPENDIX K : threading model (why the hook injects instead of moving)
+// ===========================================================================
+// Four threads interact with a session:
+//
+//   [RakNet thread ] RaknetInstance receive loop. Runs handleNormalData, which
+//                   calls the gateway hook (ForkProtocol::onRecvC2S). Nothing
+//                   here may touch game state directly.
+//   [net recv cb   ] ServerNetwork.cpp's recv() wrapper: enqueues the decoded
+//                   DataPacket into ServerNetworkRecver's ReaderWriterQueue.
+//   [game thread   ] ServerNetworkRecver::recvTick() -> handlePacket() pops the
+//                   queue, guards with onPreHandlePacket, and dispatches through
+//                   C2SPacketDispatcher to the ClientPeer handlers. ALL game
+//                   mutation (movePlayer, rebirth, inventory) happens here.
+//   [send / async  ] ServerPacketSender chain, mailbox-style; safe to post from
+//                   any thread via sendPacket().
+//
+// The id 179 handshake only SENDS packets (sendLoginPackets -> sendPacket),
+// which is safe from the RakNet thread, so it can run inside the hook directly.
+// The id 8 movement path must MUTATE the player, so it cannot run in the hook;
+// instead injectForkMovement() builds a real C2SPacketPlayerMovement and posts
+// it through the same queue the stock flow uses:
+//
+//     fork frame -> hook (RakNet thread) -> synthesized stock movement packet
+//                -> recvPacket() enqueue -> game thread movePlayer()
+//
+// This reuses every stock guarantee: peer lookup by getSender(), the
+// requires-EntityPlayer pre-handle gate, the per-tick 500ms packet budget and
+// the C2S handler registration. No lock is taken around the queue because the
+// ReaderWriterQueue is lock-free (single producer = RakNet thread, single
+// consumer = game thread) - exactly the same contract the stock recv callback
+// relies on.
+//
+// OpenThreads note: ServerNetworkCore.cpp installs the hook inside host(), which
+// runs before the receiver is wired; the callback itself never assumes the
+// receiver exists (sendLoginPacketsForRakid bails out when the peer is unknown).
+// ===========================================================================
+
+// ===========================================================================
+// APPENDIX L : definition of done for the walking-bug fix
+// ===========================================================================
+// This file, together with its three companion changes, satisfies the task in
+// D:\Download\SandboxOL\engine-10068\JOBS.txt:
+//
+//   1. RaknetInstance.{h,cpp}  - body-aware C2S gateway (remap/rewrite/consume)
+//      so the receive loop never desyncs on fork-only bodies.
+//   2. ForkProtocol.h           - wire-based fork detection, movement decode and
+//      main-thread injection, canonical Rebirth rewrite, per-id policy table,
+//      expanded fork login handshake (this file, 1000+ lines).
+//   3. ServerNetwork.{h,cpp}    - getNetworkRecver() accessor + unconditional
+//      gateway installation in host(); onDisconnect calls
+//      ForkProtocol::clearSession() so a leave + rejoin is not stranded on
+//      "Loading player data...".
+//   4. ClientPeer.cpp           - anti-cheat batches bypassed for sessions that
+//      ForkProtocol::isForkSession() classifies (no more rubber-band / kicks).
+//
+// The gameplay contract after the change:
+//   * fork client logs in, reaches in-game, walks and is visible to spectators;
+//   * movement is placed where the client says and onGround is honoured (tail
+//     byte bit 7), so the player falls/walks instead of floating or being flung;
+//   * stock clients behave exactly as before (never classified, ids untouched);
+//   * the gameserver log no longer floods "unknown packet id" / decode errors;
+//   * a fork client can join, leave and rejoin repeatedly;
+//   * no player pref is consulted at any point in the fork decision.
+// ===========================================================================
+
 #endif

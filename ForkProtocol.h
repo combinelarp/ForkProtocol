@@ -1363,10 +1363,6 @@ public:
 //    fork player. ClientPeer.cpp now bypasses those checks for sessions that
 //    ForkProtocol::isForkSession() classifies, restoring stock-like trust.
 //
-// Evidence files (cold storage, kept out of git):
-//   D:\Download\SandboxOL\Engine-10096\justfixthewalkingbugs.pcapng
-//   analyzer scripts + walk_clean.txt / walk_out*.txt under
-//   %TEMP%\opencode (wstats.py, wdetail.py, wframe.py, wcount.py)
 // ---------------------------------------------------------------------------
 
 // ===========================================================================
@@ -1793,8 +1789,6 @@ public:
 // ===========================================================================
 // APPENDIX L : definition of done for the walking-bug fix
 // ===========================================================================
-// This file, together with its three companion changes, satisfies the task in
-// D:\Download\SandboxOL\engine-10068\JOBS.txt:
 //
 //   1. RaknetInstance.{h,cpp}  - body-aware C2S gateway (remap/rewrite/consume)
 //      so the receive loop never desyncs on fork-only bodies.
